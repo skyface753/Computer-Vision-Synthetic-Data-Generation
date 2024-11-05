@@ -1,8 +1,7 @@
 numpy
-scikit_image
+scikit-image
 Shapely
 tqdm
 albumentations
 labelme
 Pillow
-skimage

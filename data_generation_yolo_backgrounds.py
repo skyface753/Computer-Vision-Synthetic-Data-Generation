@@ -18,7 +18,7 @@ from typing import List
 
 class SyntheticImageGenerator:
 
-    def __init__(self, input_dir: str, output_dir: str, image_number: int, max_objects_per_image: int, image_width: int, image_height: int, augmentation_path: str, scale_foreground_by_background_size: bool, scaling_factors: List[int], avoid_collisions: bool, parallelize: bool):
+    def __init__(self, input_dir: str, output_dir: str, image_number: int, max_objects_per_image: int, image_width: int, image_height: int, augmentation_path: str, scale_foreground_by_background_size: bool, scaling_factors: List[int], avoid_collisions: bool, parallelize: bool, yolo_input: bool, yolo_output: bool):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.image_number = image_number
@@ -31,6 +31,9 @@ class SyntheticImageGenerator:
         self.scaling_factors = scaling_factors
         self.avoid_collisions = avoid_collisions
         self.parallelize = parallelize
+        self.yolo_input = yolo_input
+        self.yolo_output = yolo_output
+        self.categories = []
 
         self._validate_input_directory()
         self._validate_output_directory()
@@ -47,12 +50,18 @@ class SyntheticImageGenerator:
                 self.foregrounds_dir = p
             elif p.name == 'backgrounds':
                 self.backgrounds_dir = p
+            elif p.name == 'labels':
+                if self.yolo_input:
+                    self.labels_dir = p
 
         assert self.foregrounds_dir is not None, 'foregrounds sub-directory was not found in the input_dir'
         assert self.backgrounds_dir is not None, 'backgrounds sub-directory was not found in the input_dir'
+        if self.yolo_input:
+            assert self.labels_dir is not None, 'labels sub-directory was not found in the input_dir'
 
         self._validate_and_process_foregrounds()
         self._validate_and_process_backgrounds()
+        self._validate_and_process_labels()
 
     def _validate_and_process_foregrounds(self):
         self.foregrounds_dict = dict()
@@ -66,6 +75,8 @@ class SyntheticImageGenerator:
 
             # Add images inside category folder to foregrounds dictionary
             self.foregrounds_dict[category.name] = list(category.glob('*.png'))
+            self.categories.append(
+                {'name': category.name, 'id': len(self.categories)})
 
         assert len(
             self.foregrounds_dict) > 0, f'No valid foreground images were found in directory: {self.foregrounds_dir} '
@@ -78,6 +89,41 @@ class SyntheticImageGenerator:
 
         assert len(
             self.background_images) > 0, f'No valid background images were found in directory: {self.backgrounds_dir}'
+
+    def _validate_and_process_labels(self):  # YOLO in txt format
+        if self.yolo_input:
+            # Check for corresponding label files
+            self.labels_dict = dict()
+
+            for label in self.labels_dir.glob('*'):
+                if label.suffix == '.txt':
+                    self.labels_dict[label.stem] = label
+
+            assert len(
+                self.labels_dict) > 0, f'No valid label files were found in directory: {self.labels_dir}'
+
+            # Check if the number of labels match the number of background images
+            assert len(self.background_images) == len(
+                self.labels_dict), f'Number of label files does not match the number of background images'
+
+            # when we have labels here, we need to update the categories from the foregrounds
+            # so we have all labels in the categories (startet with the background categories, and then added the labels from the foregrounds)
+            categories_from_labels = []
+            for label in self.labels_dict.values():
+                with open(label, 'r') as f:
+                    for line in f.readlines():
+                        category = line.split(' ')[0]
+                        if category not in categories_from_labels:
+                            categories_from_labels.append(category)
+            categories_from_labels.sort()
+            print(categories_from_labels)
+            for categorie in self.categories:
+                categorie['id'] = categorie['id'] + len(categories_from_labels)
+            counter = 0
+            for category in categories_from_labels:
+                self.categories.append({'name': category, 'id': counter})
+                counter += 1
+            print(self.categories)
 
     def _validate_output_directory(self):
         # Check if directory is empty
@@ -100,6 +146,7 @@ class SyntheticImageGenerator:
     def _generate_image(self, image_number: int):
         # Randomly choose a background image
         background_image_path = random.choice(self.background_images)
+
         print(
             f'Generating image {image_number} with background {background_image_path}')
         num_foreground_images = random.randint(1, self.max_objects_per_image)
@@ -129,8 +176,77 @@ class SyntheticImageGenerator:
         # Save annotations
         annotations['imagePath'] = f'{save_filename}.jpg'
         annotations_output_path = self.output_dir / f'{save_filename}.json'
+        # print(annotations)
         with open(annotations_output_path, 'w+') as output_file:
             json.dump(annotations, output_file)
+        if self.yolo_output:
+            if self.yolo_input:
+                # get the corresponding label file
+                old_label_file = self.labels_dir / \
+                    f'{background_image_path.stem}.txt'
+                # read the label file
+                old_label_lines = []
+                with open(old_label_file, 'r') as f:
+                    old_label_lines = f.readlines()
+            # create the new annotations
+            new_label_lines = []
+            for shape in annotations['shapes']:
+                x_center, y_center, width, height = self._shape_to_yolo(
+                    shape, annotations['imageWidth'], annotations['imageHeight'])
+                # get the id of the category
+                category_id = None
+                for category in self.categories:
+                    if category['name'] == shape['label']:
+                        category_id = category
+                        break
+                if category_id is None:
+                    warnings.warn(
+                        f'category {shape["label"]} not found in categories')
+                    continue
+                new_label_lines.append(
+                    f'{category_id["id"]} {x_center} {y_center} {width} {height}\n')
+
+            # Save label file
+            label_output_path = self.output_dir / f'{save_filename}.txt'
+            with open(label_output_path, 'w+') as output_file:
+                if self.yolo_input:
+                    for line in old_label_lines:
+                        output_file.write(line)
+                    # newline
+                    output_file.write('\n')
+                for line in new_label_lines:
+                    output_file.write(line)
+            # write a classes file
+            classes_output_path = self.output_dir / 'classes.txt'
+            # order the categories by id
+            self.categories.sort(key=lambda x: x['id'])
+            with open(classes_output_path, 'w+') as output_file:
+                for category in self.categories:
+                    output_file.write(f'{category["name"]}\n')
+
+        # Save label file
+        # label_output_path = self.output_dir / f'{save_filename}.txt'
+        # with open(label_output_path, 'w+') as output_file:
+        #     for line in label_lines:
+        #         output_file.write(line)
+
+    def _shape_to_yolo(self, shape, image_width, image_height):
+        # Get the x (center), y(center), width, and height of the bounding box
+        leftest_x = min([point[0] for point in shape['points']])
+        rightest_x = max([point[0] for point in shape['points']])
+        top_y = min([point[1] for point in shape['points']])
+        bottom_y = max([point[1] for point in shape['points']])
+        x_center = (leftest_x + rightest_x) / 2
+        y_center = (top_y + bottom_y) / 2
+        width = rightest_x - leftest_x
+        height = bottom_y - top_y
+        # Normalize the values
+        x_center /= image_width
+        y_center /= image_height
+        width /= image_width
+        height /= image_height
+        # Return the values
+        return x_center, y_center, width, height
 
     def _compose_images(self, foregrounds, background_image_path):
         # Open background image and convert to RGBA
@@ -191,9 +307,8 @@ class SyntheticImageGenerator:
             # Choose a random x,y position
             max_x_position = composite.size[0] - fg_image.size[0]
             max_y_position = composite.size[1] - fg_image.size[1]
-            assert max_x_position >= 0 and max_y_position >= 0, \
-                f'foreground {fg["image_path"]} is too big ({fg_image.size[0]}x{fg_image.size[1]}) for the requested output size ({
-                    self.image_width}x{self.image_height}), check your input parameters'
+            assert max_x_position >= 0 and max_y_position >= 0, f"""foreground {fg["image_path"]} is too big({fg_image.size[0]}x{fg_image.size[1]}) for the requested output size({
+                    self.image_width}x{self.image_height}), check your input parameters"""
             foreground_position = (random.randint(
                 0, max_x_position), random.randint(0, max_y_position))
 
@@ -419,9 +534,18 @@ if __name__ == '__main__':
                         help='Whether or not to avoid collisions (default=true)')
     parser.add_argument('--parallelize', default=False, action='store_true',
                         help='Whether or not to use multiple cores (default=false)')
+    parser.add_argument('--yolo_input', default=False, action='store_true',
+                        help='Has your background images been annotated in YOLO format?')
+    parser.add_argument('--yolo_output', default=False, action='store_true',
+                        help='Do you want to output the images in YOLO format?')
 
     args = parser.parse_args()
 
+    # remove the output dir if it exists
+    import os
+    if os.path.exists(args.output_dir):
+        import shutil
+        shutil.rmtree(args.output_dir)
     data_generator = SyntheticImageGenerator(args.input_dir, args.output_dir, args.image_number, args.max_objects_per_image, args.image_width,
-                                             args.image_height, args.augmentation_path, args.scale_foreground_by_background_size, args.scaling_factors, args.avoid_collisions, args.parallelize)
+                                             args.image_height, args.augmentation_path, args.scale_foreground_by_background_size, args.scaling_factors, args.avoid_collisions, args.parallelize, args.yolo_input, args.yolo_output)
     data_generator.generate_images()
